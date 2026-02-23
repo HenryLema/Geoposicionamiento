@@ -1,0 +1,286 @@
+#include <WiFi.h>
+#include <time.h>
+
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ---------------- WIFI ----------------
+#define WIFI_SSID     "Malware"
+#define WIFI_PASSWORD "1001769304"
+
+// ---------------- FIREBASE ----------------
+#define API_KEY       "AIzaSyB1PlndJO4Ntcx-1kBF0_9civhqmw6RW6o"
+#define DATABASE_URL  "https://gpsdb-f5976-default-rtdb.firebaseio.com/"
+
+// ---------------- GPS (NEO-6M) ----------------
+static const int GPS_RX_PIN = 16;  // ESP32 RX2 (GPS TX)
+static const int GPS_TX_PIN = 17;  // ESP32 TX2 (GPS RX) opcional
+static const uint32_t GPS_BAUD = 9600;
+
+TinyGPSPlus gps;
+HardwareSerial GPS_Serial(2);
+
+// ---------------- NTP Ecuador (UTC-5) ----------------
+const long  gmtOffset_sec = -5 * 3600;
+const int   daylightOffset_sec = 0;
+
+// ---------------- Firebase objects ----------------
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ---------------- Timing ----------------
+unsigned long lastSend = 0;
+const unsigned long SEND_INTERVAL_MS = 3000;
+
+// ---------------- Anti-rebote (solo para saltos absurdos) ----------------
+bool hasLastAccepted = false;
+double lastLat = 0.0, lastLon = 0.0;
+unsigned long lastAcceptedMs = 0;
+
+// Parámetros (ajustables)
+const double MAX_SPEED_KMH_FOR_SANITY = 90.0;   // velocidad máxima razonable (bus urbano)
+const double EXTRA_MARGIN = 1.8;                // margen para no ser agresivo (1.3–2.5)
+const double MIN_ABS_JUMP_M = 120.0;            // salto mínimo para considerar “sospechoso”
+const double HARD_MAX_JUMP_M = 800.0;           // si salta más que esto en 3s => casi seguro error
+
+// Distancia Haversine (metros)
+double haversineMeters(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000.0;
+  const double toRad = 0.017453292519943295; // PI/180
+  double dLat = (lat2 - lat1) * toRad;
+  double dLon = (lon2 - lon1) * toRad;
+
+  double a = sin(dLat / 2) * sin(dLat / 2) +
+             cos(lat1 * toRad) * cos(lat2 * toRad) *
+             sin(dLon / 2) * sin(dLon / 2);
+
+  double c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+  return R * c;
+}
+
+// ---------------- Helpers ----------------
+String getEcuadorTimeString() {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    char buffer[30];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    return String(buffer);
+  }
+  return "NTP_NO_TIME";
+}
+
+void connectWiFi(uint32_t timeoutMs = 20000) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Conectando a WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("✅ WiFi conectado. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("⚠️ No se pudo conectar a WiFi (timeout). Seguirá sin WiFi.");
+  }
+}
+
+void setupNTP() {
+  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org", "time.nist.gov", "time.google.com");
+  Serial.println("⏱️ NTP configurado para Ecuador (UTC-5).");
+}
+
+void setupFirebase() {
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.reconnectWiFi(true);
+  fbdo.setResponseSize(4096);
+
+  Serial.println("🔥 Iniciando Firebase...");
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("✅ SignUp anónimo OK.");
+  } else {
+    Serial.print("❌ SignUp falló: ");
+    Serial.println(config.signer.signupError.message.c_str());
+  }
+
+  Firebase.begin(&config, &auth);
+}
+
+bool firebaseReady() {
+  return Firebase.ready();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Serial.println("\n=== ESP32 + NEO-6M + Firebase (cada 3s) + Anti-saltos ===");
+
+  GPS_Serial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("📡 GPS en Serial2 iniciado (9600 bps).");
+
+  connectWiFi();
+  setupNTP();
+  setupFirebase();
+}
+
+void loop() {
+  // Leer GPS continuamente
+  while (GPS_Serial.available()) {
+    gps.encode(GPS_Serial.read());
+  }
+
+  // Reintento WiFi si se cae (cada 5s)
+  if (WiFi.status() != WL_CONNECTED) {
+    static unsigned long lastWiFiTry = 0;
+    if (millis() - lastWiFiTry > 5000) {
+      lastWiFiTry = millis();
+      Serial.println("⚠️ WiFi caído. Reintentando...");
+      connectWiFi(8000);
+    }
+  }
+
+  // Enviar/Imprimir cada 3s SIEMPRE
+  if (millis() - lastSend >= SEND_INTERVAL_MS) {
+    lastSend = millis();
+
+    String ecTime = getEcuadorTimeString();
+
+    // Datos GPS TAL CUAL
+    bool validLoc = gps.location.isValid();
+    double lat = validLoc ? gps.location.lat() : 0.0;
+    double lon = validLoc ? gps.location.lng() : 0.0;
+
+    int sats = gps.satellites.isValid() ? gps.satellites.value() : -1;
+    double hdop = gps.hdop.isValid() ? gps.hdop.hdop() : -1;
+
+    double speedKmh = gps.speed.isValid() ? gps.speed.kmph() : -1;
+    double courseDeg = gps.course.isValid() ? gps.course.deg() : -1;
+    double altM = gps.altitude.isValid() ? gps.altitude.meters() : -9999;
+
+    // -------- Serial --------
+    Serial.println("--------------------------------------------------");
+    Serial.print("Hora Ecuador: ");
+    Serial.println(ecTime);
+
+    Serial.print("Fix: ");
+    Serial.print(validLoc ? "✅" : "❌");
+    Serial.print(" | Lat: ");
+    Serial.print(lat, 6);
+    Serial.print(" | Lon: ");
+    Serial.print(lon, 6);
+
+    Serial.print(" | Sats: ");
+    Serial.print(sats);
+    Serial.print(" | HDOP: ");
+    Serial.print(hdop);
+
+    Serial.print(" | Vel(km/h): ");
+    Serial.print(speedKmh);
+    Serial.print(" | Rumbo(deg): ");
+    Serial.print(courseDeg);
+    Serial.print(" | Alt(m): ");
+    Serial.println(altM);
+
+    // ----------------- ✅ Anti-saltos (solo evita puntos absurdos) -----------------
+    bool acceptPoint = true;
+    double jumpM = 0.0;
+
+    if (!validLoc || lat == 0.0 || lon == 0.0) {
+      acceptPoint = false; // sin fix real
+    } else if (!hasLastAccepted) {
+      // primer punto siempre se acepta
+      acceptPoint = true;
+    } else {
+      unsigned long nowMs = millis();
+      double dtS = (nowMs - lastAcceptedMs) / 1000.0;
+      if (dtS < 0.5) dtS = SEND_INTERVAL_MS / 1000.0;
+
+      jumpM = haversineMeters(lastLat, lastLon, lat, lon);
+
+      // velocidad máxima permitida por tiempo (sanity)
+      double maxSpeedKmh = MAX_SPEED_KMH_FOR_SANITY;
+      if (gps.speed.isValid() && speedKmh > 0 && speedKmh < 140) {
+        // si el GPS reporta velocidad válida, permitimos un poco más, pero no infinito
+        maxSpeedKmh = max(maxSpeedKmh, speedKmh * 1.7);
+        if (maxSpeedKmh > 140) maxSpeedKmh = 140;
+      }
+
+      double allowedM = (maxSpeedKmh / 3.6) * dtS * EXTRA_MARGIN;
+
+      // regla dura: salto enorme => descartar (casi siempre error)
+      if (jumpM > HARD_MAX_JUMP_M) {
+        acceptPoint = false;
+      }
+      // regla principal: si el salto supera lo físicamente posible en ese dt => descartar
+      else if (jumpM > max(MIN_ABS_JUMP_M, allowedM)) {
+        acceptPoint = false;
+      }
+    }
+
+    if (!acceptPoint) {
+      Serial.print("⚠️ Punto IGNORADO por salto/rebote. Jump(m): ");
+      Serial.println(jumpM, 1);
+    }
+
+    // -------- Firebase --------
+    // Enviar solo puntos aceptados (para que la ruta tenga lógica)
+    if (acceptPoint && WiFi.status() == WL_CONNECTED && firebaseReady()) {
+      FirebaseJson json;
+      json.set("hora_ecuador", ecTime);
+
+      json.set("fix", validLoc);
+      json.set("lat", lat);
+      json.set("lon", lon);
+
+      json.set("satelites", sats);
+      json.set("hdop", hdop);
+
+      json.set("speed_kmh", speedKmh);
+      json.set("course_deg", courseDeg);
+      json.set("alt_m", altM);
+
+      json.set("ts_ms", (int)millis());
+
+      if (Firebase.RTDB.setJSON(&fbdo, "/NodoMovil", &json)) {
+        Serial.println("✅ Enviado a Firebase.");
+        // actualizar último punto aceptado SOLO si se envió
+        hasLastAccepted = true;
+        lastLat = lat;
+        lastLon = lon;
+        lastAcceptedMs = millis();
+      } else {
+        Serial.print("❌ Error Firebase: ");
+        Serial.println(fbdo.errorReason());
+      }
+    } else {
+      if (!acceptPoint) {
+        Serial.println("ℹ️ No se envió a Firebase porque el punto fue descartado (rebote).");
+      } else {
+        Serial.println("⚠️ Sin WiFi o Firebase no listo; no se envió.");
+      }
+
+      // Si NO hay WiFi/Firebase pero el punto es válido, igual actualizamos el “último aceptado”
+      // para que al volver internet no compare contra un punto viejísimo.
+      if (acceptPoint) {
+        hasLastAccepted = true;
+        lastLat = lat;
+        lastLon = lon;
+        lastAcceptedMs = millis();
+      }
+    }
+  }
+}
